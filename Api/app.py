@@ -13,7 +13,7 @@ from ocr_service import process_document
 app = Flask(__name__)
 CORS(app)
 
-# Configuration d
+# Configuration 
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
