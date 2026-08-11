@@ -294,6 +294,7 @@ const ValidationPage = () => {
                     onChange={handleChange}
                   >
                     <option value="Facture">Facture</option>
+                    <option value="Devis">Devis</option>
                     <option value="Reçu">Reçu</option>
                     <option value="Avoir">Avoir</option>
                     <option value="Note">Note</option>

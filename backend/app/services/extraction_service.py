@@ -95,17 +95,20 @@ _paddle_ocr = None
 
 
 def _get_paddle_ocr():
-    """Return a cached PaddleOCR instance (loads models only once)."""
+    """Return a cached PaddleOCR instance (loads models only once).
+    Compatible with PaddleOCR 3.x API.
+    """
     global _paddle_ocr
     if _paddle_ocr is None:
         try:
             from paddleocr import PaddleOCR
-            # lang='fr' enables French + English simultaneously;
-            # use_angle_cls=True corrects rotated text blocks.
+            # PaddleOCR 3.x API:
+            # - use_textline_orientation replaces deprecated use_angle_cls
+            # - show_log was removed in 3.x
+            # - lang='fr' supports French + Latin script invoices
             _paddle_ocr = PaddleOCR(
-                use_angle_cls=True,
+                use_textline_orientation=True,
                 lang="fr",
-                show_log=False,
             )
             print("[PaddleOCR] Model loaded successfully.")
         except Exception as exc:
@@ -171,38 +174,36 @@ class ExtractionService:
     def _extract_pdf_text(self, path: Path) -> str:
         text = ""
 
-        # Primary: PyMuPDF — fast, best for text-based PDFs
+        # Primary: pdfplumber — preserves visual layout and table structures better
         try:
-            import fitz
-            doc = fitz.open(str(path))
-            for page in doc:
-                text += page.get_text()
-            doc.close()
+            import pdfplumber
+            with pdfplumber.open(str(path)) as pdf:
+                for page in pdf.pages:
+                    # extract_text(layout=True) preserves spacing and visual alignment
+                    extracted = page.extract_text(layout=True)
+                    if extracted:
+                        text += extracted + "\n"
             text = text.strip()
         except Exception as exc:
-            print(f"[PyMuPDF] Extraction failed: {exc}")
+            print(f"[pdfplumber] Extraction failed: {exc}")
             text = ""
 
-        # Fallback 1: pdfplumber — better at structured/tabular PDFs + table extraction
+        # Fallback 1: PyMuPDF — fast, but messes up tables
         if not text:
             try:
-                import pdfplumber
-                with pdfplumber.open(str(path)) as pdf:
-                    for page in pdf.pages:
-                        extracted = page.extract_text()
-                        if extracted:
-                            text += extracted + "\n"
-                        # Also extract tables — preserves amounts/labels that flow in columns
-                        for table in page.extract_tables():
-                            for row in table:
-                                if row:
-                                    text += " | ".join(cell or "" for cell in row) + "\n"
+                import fitz
+                doc = fitz.open(str(path))
+                for page in doc:
+                    text += page.get_text("text")
+                doc.close()
                 text = text.strip()
             except Exception as exc:
-                print(f"[pdfplumber] Extraction failed: {exc}")
+                print(f"[PyMuPDF] Extraction failed: {exc}")
+                text = ""
 
         # Fallback 2: page-by-page OCR (scanned PDF)
-        if not text:
+        if not text or len(text) < 50:
+            text = ""
             try:
                 import fitz
                 doc = fitz.open(str(path))
@@ -270,21 +271,35 @@ class ExtractionService:
             if ocr is None:
                 raise RuntimeError("PaddleOCR could not be initialised")
 
-            result = ocr.ocr(enhanced_bgr, cls=True)
+            # Note: cls=True removed — use_textline_orientation handles orientation
+            result = ocr.ocr(enhanced_bgr)
 
             # ── Flatten results into text lines ──
+            # Handles both PaddleOCR v2 (list of lists) and v3 (OCRResult objects)
             lines: list[str] = []
             if result:
                 for page in result:
                     if page is None:
                         continue
-                    for box in page:
-                        # box = [[coords], (text, confidence)]
-                        text_info = box[1]
-                        text_line = text_info[0] if isinstance(text_info, (list, tuple)) else str(text_info)
-                        text_line = text_line.strip()
-                        if text_line:
-                            lines.append(text_line)
+                    # v3 returns OCRResult objects with .rec_texts / .rec_scores attrs
+                    if hasattr(page, 'rec_texts'):
+                        for text_line in page.rec_texts:
+                            if text_line and text_line.strip():
+                                lines.append(text_line.strip())
+                    else:
+                        # v2 format: list of [box_coords, (text, score)]
+                        for box in page:
+                            try:
+                                text_info = box[1]
+                                if isinstance(text_info, (list, tuple)):
+                                    text_line = text_info[0]
+                                else:
+                                    text_line = str(text_info)
+                                text_line = text_line.strip()
+                                if text_line:
+                                    lines.append(text_line)
+                            except (IndexError, TypeError):
+                                continue
 
             recognized_text = "\n".join(lines).strip()
             print(f"[PaddleOCR] Extracted {len(lines)} lines.")
@@ -404,9 +419,9 @@ class ExtractionService:
                 "Si un montant contient des espaces comme '3 732', c'est 3732.\n"
                 "R6. MULTI-PASSES : si un champ apparaît dans plusieurs passes OCR avec des valeurs différentes, "
                 "prends la valeur la plus longue et la plus cohérente avec le contexte.\n"
-                "R7. NUMÉRO DE FACTURE : inclure les préfixes/suffixes (ex: 'FAC-2024-001', 'F/2024/123'). Ne pas tronquer.\n"
+                "R7. NUMÉRO DE DOCUMENT (Facture/Devis) : correspond au 'invoice_number' dans le JSON. Inclure les préfixes/suffixes (ex: 'devis - 2026001', 'FAC-2024-001'). Ne pas tronquer.\n"
                 "R8. MATRICULE FISCAL tunisien : format typique '1234567A/B/C/000' ou '1234567X/A/P/000'. Retourne-le tel quel.\n"
-                "R9. document_type : exactement l'une de ces valeurs : 'Facture', 'Reçu', 'Avoir', 'Note', 'Autre'.\n"
+                "R9. document_type : exactement l'une de ces valeurs : 'Facture', 'Devis', 'Reçu', 'Avoir', 'Note', 'Autre'.\n"
                 "R10. Retourne UNIQUEMENT un JSON valide, sans markdown, sans explication, sans texte avant ou après.\n"
                 "VÉRIFICATION : avant de répondre, vérifie que total_ttc ≈ total_ht + vat_amount + stamp_amount. "
                 "Si l'écart est > 1%, marque une warning. Ne corrige pas les valeurs, signale seulement."
@@ -418,14 +433,14 @@ class ExtractionService:
                 "{\n"
                 '  "supplier": "Nom exact du fournisseur émetteur",\n'
                 '  "tax_identifier": "Matricule fiscal ou null",\n'
-                '  "invoice_number": "Numéro complet de la facture ou null",\n'
+                '  "invoice_number": "Numéro complet de la facture ou du devis ou null",\n'
                 '  "invoice_date": "YYYY-MM-DD ou null",\n'
                 '  "total_ht": "montant en string ex: 1500.000 ou null",\n'
                 '  "vat_amount": "montant TVA en string ou null (jamais calculé)",\n'
                 '  "stamp_amount": "montant timbre en string ou null",\n'
                 '  "total_ttc": "montant TTC en string ou null",\n'
                 '  "currency": "TND par défaut, sinon EUR/USD/etc.",\n'
-                '  "document_type": "Facture|Reçu|Avoir|Note|Autre",\n'
+                '  "document_type": "Facture|Devis|Reçu|Avoir|Note|Autre",\n'
                 '  "category": "catégorie parmi la liste ou null",\n'
                 '  "confidence": {"supplier":"high","invoice_number":"medium",...},\n'
                 '  "missing_fields": ["champs absents"],\n'
@@ -465,12 +480,12 @@ class ExtractionService:
 
             t = threading.Thread(target=_call, daemon=True)
             t.start()
-            t.join(timeout=60)   # give model up to 60 s to respond
+            t.join(timeout=180)   # 180s — llama3/qwen on CPU can be slow
 
             if _err_box:
                 raise _err_box[0]
             if not _result_box:
-                raise TimeoutError("Ollama did not respond within 60 seconds")
+                raise TimeoutError("Ollama did not respond within 180 seconds")
 
             response = _result_box[0]
             content = response.message.content.strip()
@@ -650,6 +665,7 @@ class ExtractionService:
             r"\bN[°oO]\s*(\d{6,})\b",
             r"(?:Num[eé]ro|N°|No\.?)\s*[:\s]*([A-Z0-9][-A-Z0-9/]{3,})",
             r"(?:Bon de commande|BC)\s*[Nn]?[°oO]?\.?\s*:?\s*([A-Z0-9][-A-Z0-9/]{2,})",
+            r"[Dd]evis\s*[-:\s]+\s*([A-Z0-9][-A-Z0-9/]{2,})",
         ]
         for pat in patterns:
             m = re.search(pat, text)
@@ -741,7 +757,7 @@ class ExtractionService:
         clean["currency"] = str(raw_currency or "TND").strip().upper()[:10] or "TND"
 
         # Normalise document_type
-        allowed_types = {"Facture", "Reçu", "Avoir", "Note", "Autre"}
+        allowed_types = {"Facture", "Devis", "Reçu", "Avoir", "Note", "Autre"}
         dt = clean.get("document_type")
         clean["document_type"] = dt if dt in allowed_types else "Facture"
         
