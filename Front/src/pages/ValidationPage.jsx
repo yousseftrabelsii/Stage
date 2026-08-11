@@ -25,6 +25,7 @@ const ValidationPage = () => {
     total_ttc:      '',
     currency:       'EUR',
     document_type:  'Facture',
+    category:       '',
     filename:       '',
   });
 
@@ -46,6 +47,7 @@ const ValidationPage = () => {
         total_ttc:      inv.total_ttc != null ? inv.total_ttc : '',
         currency:       inv.currency      ?? 'EUR',
         document_type:  inv.document_type ?? 'Facture',
+        category:       inv.category      ?? '',
         filename:       inv.filename      ?? '',
       });
 
@@ -296,6 +298,37 @@ const ValidationPage = () => {
                     <option value="Avoir">Avoir</option>
                     <option value="Note">Note</option>
                     <option value="Autre">Autre</option>
+                  </Form.Select>
+                </Form.Group>
+
+                {/* Catégorie */}
+                <Form.Group className="mb-4">
+                  <Form.Label className="small fw-semibold text-muted mb-1">Catégorie</Form.Label>
+                  <Form.Select
+                    id="field-category"
+                    name="category"
+                    value={formData.category}
+                    onChange={handleChange}
+                  >
+                    <option value="">-- Sélectionnez une catégorie --</option>
+                    <option value="Achats de marchandises">Achats de marchandises (Produits destinés à la revente)</option>
+                    <option value="Matières premières">Matières premières (Bois, acier, farine...)</option>
+                    <option value="Fournitures de bureau">Fournitures de bureau (Papier, stylos, cartouches)</option>
+                    <option value="Informatique">Informatique (Ordinateurs, logiciels, licences)</option>
+                    <option value="Télécommunication">Télécommunication (Téléphone, Internet)</option>
+                    <option value="Eau, électricité, gaz">Eau, électricité, gaz (Factures des fournisseurs d'énergie)</option>
+                    <option value="Loyer">Loyer (Bureaux, magasins, entrepôts)</option>
+                    <option value="Assurance">Assurance (Véhicule, locaux, responsabilité civile)</option>
+                    <option value="Publicité et marketing">Publicité et marketing (Facebook Ads, Google Ads, affiches)</option>
+                    <option value="Transport">Transport (Taxi, carburant, livraison)</option>
+                    <option value="Déplacements">Déplacements (Billets d'avion, hôtels, missions)</option>
+                    <option value="Entretien et réparation">Entretien et réparation (Maintenance des équipements)</option>
+                    <option value="Honoraires">Honoraires (Comptable, avocat, consultant)</option>
+                    <option value="Formation">Formation (Cours, séminaires)</option>
+                    <option value="Frais bancaires">Frais bancaires (Commissions, tenue de compte)</option>
+                    <option value="Impôts et taxes">Impôts et taxes (Taxes locales, droits divers)</option>
+                    <option value="Salaires et charges sociales">Salaires et charges sociales (Rémunération du personnel)</option>
+                    <option value="Immobilisations">Immobilisations (Machines, véhicules, mobilier, bâtiments)</option>
                   </Form.Select>
                 </Form.Group>
 

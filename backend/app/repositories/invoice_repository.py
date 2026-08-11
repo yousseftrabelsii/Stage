@@ -25,3 +25,15 @@ class InvoiceRepository:
 
     def list_invoices(self) -> list[Invoice]:
         return Invoice.query.order_by(Invoice.created_at.desc()).all()
+
+    def delete_invoice(self, invoice: Invoice) -> None:
+        # Document is cascaded from Invoice? 
+        # Actually in models: Document has invoice = db.relationship(..., cascade="all, delete-orphan")
+        # So deleting Document deletes Invoice. Wait, no. Document is the parent.
+        # Invoice has document = db.relationship... wait, Invoice has document_id = db.ForeignKey('documents.id').
+        # Let's delete the document, which will cascade to invoice and extraction runs.
+        if invoice.document:
+            db.session.delete(invoice.document)
+        else:
+            db.session.delete(invoice)
+        db.session.commit()
