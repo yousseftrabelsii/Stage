@@ -12,7 +12,9 @@ openpyxl>=3.0
 pdfplumber>=0.10
 PyMuPDF>=1.23
 
-pytesseract>=0.3.10
+# PaddleOCR (replaces Tesseract)
+paddlepaddle>=3.0.0
+paddleocr>=2.7.0
 opencv-python>=4.0
 Pillow>=10.0
 numpy>=1.24

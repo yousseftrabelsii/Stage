@@ -3,10 +3,10 @@ Extraction service — merged OCR + AI pipeline.
 
 Priority order for text extraction:
   PDF  → PyMuPDF (text layer) → pdfplumber → page-by-page OCR
-  Image → OpenCV preprocessing → dual-pass Tesseract (PSM 3 + PSM 6)
+  Image → OpenCV preprocessing → PaddleOCR (multi-lang, angle-corrected)
 
 Priority order for structured extraction:
-  Ollama (ollama.chat, French system prompt) → spaCy NER fallback → heuristic regex fallback
+  Ollama / Qwen2.5 (ollama.chat, French system prompt) → spaCy NER fallback → heuristic regex fallback
 """
 from __future__ import annotations
 
@@ -89,30 +89,29 @@ def _get_nlp():
     return _nlp
 
 
-# ── Tesseract binary configuration ────────────────────────────────────────────
+# ── PaddleOCR lazy singleton ───────────────────────────────────────────────────
 
-def _configure_tesseract():
-    """Set tesseract_cmd from config or well-known Windows paths."""
-    try:
-        import pytesseract
-    except ImportError:
-        return
+_paddle_ocr = None
 
-    cmd = current_app.config.get("TESSERACT_CMD", "")
-    if cmd and os.path.isfile(cmd):
-        pytesseract.pytesseract.tesseract_cmd = cmd
-        return
 
-    # Auto-detect common Windows paths
-    candidates = [
-        r"D:\programme\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            pytesseract.pytesseract.tesseract_cmd = path
-            return
+def _get_paddle_ocr():
+    """Return a cached PaddleOCR instance (loads models only once)."""
+    global _paddle_ocr
+    if _paddle_ocr is None:
+        try:
+            from paddleocr import PaddleOCR
+            # lang='fr' enables French + English simultaneously;
+            # use_angle_cls=True corrects rotated text blocks.
+            _paddle_ocr = PaddleOCR(
+                use_angle_cls=True,
+                lang="fr",
+                show_log=False,
+            )
+            print("[PaddleOCR] Model loaded successfully.")
+        except Exception as exc:
+            print(f"[PaddleOCR] Failed to initialise: {exc}")
+            _paddle_ocr = None
+    return _paddle_ocr
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -184,7 +183,7 @@ class ExtractionService:
             print(f"[PyMuPDF] Extraction failed: {exc}")
             text = ""
 
-        # Fallback 1: pdfplumber — better at structured/tabular PDFs
+        # Fallback 1: pdfplumber — better at structured/tabular PDFs + table extraction
         if not text:
             try:
                 import pdfplumber
@@ -193,6 +192,11 @@ class ExtractionService:
                         extracted = page.extract_text()
                         if extracted:
                             text += extracted + "\n"
+                        # Also extract tables — preserves amounts/labels that flow in columns
+                        for table in page.extract_tables():
+                            for row in table:
+                                if row:
+                                    text += " | ".join(cell or "" for cell in row) + "\n"
                 text = text.strip()
             except Exception as exc:
                 print(f"[pdfplumber] Extraction failed: {exc}")
@@ -203,7 +207,8 @@ class ExtractionService:
                 import fitz
                 doc = fitz.open(str(path))
                 for page_num in range(len(doc)):
-                    pix = doc[page_num].get_pixmap(matrix=fitz.Matrix(2, 2))
+                    # 300 DPI equivalent (factor 300/72 ≈ 4.17)
+                    pix = doc[page_num].get_pixmap(matrix=fitz.Matrix(4, 4))
                     img_bytes = pix.tobytes("png")
                     text += self._ocr_image_bytes(img_bytes) + "\n"
                 doc.close()
@@ -217,63 +222,103 @@ class ExtractionService:
         return self._ocr_image_bytes(path.read_bytes())
 
     def _ocr_image_bytes(self, payload: bytes) -> str:
-        """Dual-pass Tesseract OCR with OpenCV preprocessing."""
+        """PaddleOCR with enhanced OpenCV preprocessing."""
         try:
             import cv2
             import numpy as np
-            import pytesseract
-
-            _configure_tesseract()
 
             image = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
             if image is None:
                 raise ValueError("Invalid image data")
 
-            # Upscale + grayscale — 1.5x is enough for printed invoices without excessive RAM
+            # ── Upscale to at least 2400px on the long side for 300 DPI quality ──
             h, w = image.shape[:2]
-            if max(h, w) < 2000:  # only upscale small images
-                image = cv2.resize(image, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+            long_side = max(h, w)
+            if long_side < 2400:
+                scale = 2400 / long_side
+                image = cv2.resize(image, None, fx=scale, fy=scale,
+                                   interpolation=cv2.INTER_CUBIC)
+
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-            # Set TESSDATA_PREFIX before doing anything else
-            tessdata_dir = current_app.config.get("TESSDATA_DIR", "")
-            if tessdata_dir and Path(tessdata_dir).exists():
-                os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
-                pytesseract.pytesseract.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
+            # ── Denoise ──
+            gray = cv2.fastNlMeansDenoising(gray, h=10)
 
-            requested = [l.strip() for l in current_app.config.get("TESSERACT_LANGUAGES", "eng").split("+") if l.strip()]
+            # ── CLAHE — improve local contrast for faded/uneven scans ──
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
 
-            # Safely check which langs are installed — never crash the whole request
-            try:
-                available = set(pytesseract.get_languages(config=f'--tessdata-dir "{tessdata_dir}"' if tessdata_dir else ""))
-                languages = [l for l in requested if l in available]
-            except Exception as lang_err:
-                print(f"[Tesseract] lang check failed ({lang_err}), using requested: {requested}")
-                languages = requested
+            # ── Sharpen — improves blurry/photocopied documents ──
+            kernel_sharpen = np.array([[-1, -1, -1],
+                                        [-1,  9, -1],
+                                        [-1, -1, -1]])
+            gray = cv2.filter2D(gray, -1, kernel_sharpen)
 
-            if not languages:
-                languages = ["eng"]
-            lang_str = "+".join(languages)
-            print(f"[Tesseract] Using languages: {lang_str}")
-
-            # Pass 1 — PSM 3: full automatic page segmentation (layout analysis)
-            text_psm3 = pytesseract.image_to_string(gray, lang=lang_str, config="--oem 3 --psm 3")
-            # Pass 2 — PSM 6: uniform block of text (line-by-line across columns)
-            text_psm6 = pytesseract.image_to_string(gray, lang=lang_str, config="--oem 3 --psm 6")
-
-            combined = (
-                "=== OCR PASS 1 (Layout Analysis) ===\n"
-                f"{text_psm3}\n\n"
-                "=== OCR PASS 2 (Line-by-Line Analysis) ===\n"
-                f"{text_psm6}"
+            # ── Deskew ── (straighten rotated scans up to ±10°)
+            # Work on a binary copy for deskew detection, then apply to color image
+            _, binary_deskew = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
             )
-            return combined.strip()
+            binary_deskew = self._deskew(binary_deskew)
+
+            # Reconstruct a color (BGR) enhanced image from deskewed gray for PaddleOCR
+            enhanced_gray = self._deskew(gray)
+            enhanced_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+
+            # ── Run PaddleOCR ──
+            ocr = _get_paddle_ocr()
+            if ocr is None:
+                raise RuntimeError("PaddleOCR could not be initialised")
+
+            result = ocr.ocr(enhanced_bgr, cls=True)
+
+            # ── Flatten results into text lines ──
+            lines: list[str] = []
+            if result:
+                for page in result:
+                    if page is None:
+                        continue
+                    for box in page:
+                        # box = [[coords], (text, confidence)]
+                        text_info = box[1]
+                        text_line = text_info[0] if isinstance(text_info, (list, tuple)) else str(text_info)
+                        text_line = text_line.strip()
+                        if text_line:
+                            lines.append(text_line)
+
+            recognized_text = "\n".join(lines).strip()
+            print(f"[PaddleOCR] Extracted {len(lines)} lines.")
+            return recognized_text
 
         except ImportError as exc:
-            raise RuntimeError("OpenCV and Tesseract are required for OCR") from exc
+            raise RuntimeError("OpenCV and PaddleOCR are required for OCR") from exc
         except Exception as exc:
-            print(f"[Tesseract] OCR failed: {exc}")
+            import traceback
+            print(f"[PaddleOCR] OCR failed: {exc}")
+            traceback.print_exc()
             return ""
+
+    @staticmethod
+    def _deskew(image):
+        """Rotate the image to correct skew using Hough line analysis."""
+        try:
+            import cv2
+            import numpy as np
+            coords = np.column_stack(np.where(image < 128))  # dark pixels
+            if len(coords) < 100:
+                return image
+            angle = cv2.minAreaRect(coords.astype(np.float32))[-1]
+            if angle < -45:
+                angle = 90 + angle
+            if abs(angle) < 0.5:   # negligible — skip rotation
+                return image
+            (h, w) = image.shape[:2]
+            M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+            return cv2.warpAffine(image, M, (w, h),
+                                  flags=cv2.INTER_CUBIC,
+                                  borderMode=cv2.BORDER_REPLICATE)
+        except Exception:
+            return image
 
     # ── Structured data extraction ─────────────────────────────────────────────
 
@@ -307,7 +352,7 @@ class ExtractionService:
         return None
 
     def _get_best_model(self) -> str:
-
+        """Return the best available Ollama model, preferring Qwen2.5 variants."""
         try:
             import ollama as ollama_lib
             models_info = ollama_lib.list()
@@ -317,20 +362,26 @@ class ExtractionService:
             elif isinstance(models_info, dict) and 'models' in models_info:
                 models = [m.get('model') if isinstance(m, dict) else getattr(m, 'model', None) for m in models_info['models']]
                 models = [m for m in models if m]
-            
+
             if not models:
-                return current_app.config.get("OLLAMA_MODEL", "llama3.1")
-            
-            for preferred in ['llama3.1', 'llama3:latest', 'llama3', 'mistral', 'qwen', 'llama']:
+                return current_app.config.get("OLLAMA_MODEL", "qwen2.5:7b")
+
+            # Priority: Qwen2.5 (best accuracy, fits 8 GB RAM with Q4 quantisation)
+            # then older Qwen, then Llama3 variants as fallback.
+            for preferred in [
+                'qwen2.5:7b', 'qwen2.5:3b', 'qwen2.5',
+                'qwen2:7b', 'qwen2', 'qwen',
+                'llama3.1', 'llama3:latest', 'llama3', 'mistral', 'llama',
+            ]:
                 if preferred in models:
                     return preferred
                 for m in models:
-                    if preferred in m:
+                    if preferred in m.lower():
                         return m
             return models[0]
         except Exception as e:
             print(f"[Ollama] Failed to detect models: {e}")
-            return current_app.config.get("OLLAMA_MODEL", "llama3.1")
+            return current_app.config.get("OLLAMA_MODEL", "qwen2.5:7b")
 
     def extract_structured_data(self, text: str) -> tuple[dict[str, Any], str]:
         """Try Ollama first, fall back to spaCy NER, then regex heuristics."""
@@ -340,36 +391,55 @@ class ExtractionService:
             import ollama as ollama_lib
 
             system_prompt = (
-                "Tu es un assistant d'extraction de données de factures extrêmement précis et rigoureux.\n"
-                "Ton rôle est d'analyser le texte extrait (qui peut provenir d'un PDF ou de plusieurs passes d'OCR) pour remplir une structure de données.\n"
-                "Consignes de rigueur absolue :\n"
-                "1. Ne devine pas et ne calcule pas la TVA (vat_amount). Si la TVA/Taxes n'est pas écrite noir sur blanc dans le texte, sa valeur est null.\n"
-                "2. Ne confonds jamais le fournisseur (supplier) et le client. Le fournisseur est l'émetteur du document (souvent en haut de page).\n"
-                "3. Normalise document_type en une des valeurs suivantes uniquement : \"Facture\", \"Reçu\", \"Avoir\", \"Note\", \"Autre\".\n"
-                "4. Nettoie les coquilles d'OCR évidentes (ex: \"US0\" en devises → \"USD\").\n"
-                "5. Réponds uniquement sous la forme d'un objet JSON valide, sans Markdown."
+                "Tu es un expert comptable tunisien spécialisé dans l'extraction précise de données de factures.\n"
+                "Le texte fourni provient d'un OCR multi-passes : il peut contenir des doublons, artefacts et bruit.\n\n"
+                "RÈGLES ABSOLUES — respecte-les sans exception :\n"
+                "R1. NE JAMAIS calculer la TVA mathématiquement. Si vat_amount n'est pas écrit en toutes lettres dans le document, retourne null.\n"
+                "R2. FOURNISSEUR = l'ÉMETTEUR de la facture (généralement en grand en haut de page, ou section 'Fournisseur/Exporter'). "
+                "Ce n'est pas le client/destinataire. Exclus les mentions génériques (ex: 'Facture', 'Client', 'Doit'). Prends la raison sociale exacte.\n"
+                "R3. DATE = date d'émission/facture uniquement. Ignore toute date d'échéance ou de livraison.\n"
+                "R4. MONTANTS tunisiens : '3,732' = 3.732 DT (virgule = décimal). '1,400.00' = 1400.000 (virgule = milliers). "
+                "Retourne toujours un nombre décimal en string (ex: '3.732', '1400.000').\n"
+                "R5. ARTEFACTS OCR : corrige '0'/'O', '1'/'l'/'I', espaces dans les chiffres, tirets parasites. "
+                "Si un montant contient des espaces comme '3 732', c'est 3732.\n"
+                "R6. MULTI-PASSES : si un champ apparaît dans plusieurs passes OCR avec des valeurs différentes, "
+                "prends la valeur la plus longue et la plus cohérente avec le contexte.\n"
+                "R7. NUMÉRO DE FACTURE : inclure les préfixes/suffixes (ex: 'FAC-2024-001', 'F/2024/123'). Ne pas tronquer.\n"
+                "R8. MATRICULE FISCAL tunisien : format typique '1234567A/B/C/000' ou '1234567X/A/P/000'. Retourne-le tel quel.\n"
+                "R9. document_type : exactement l'une de ces valeurs : 'Facture', 'Reçu', 'Avoir', 'Note', 'Autre'.\n"
+                "R10. Retourne UNIQUEMENT un JSON valide, sans markdown, sans explication, sans texte avant ou après.\n"
+                "VÉRIFICATION : avant de répondre, vérifie que total_ttc ≈ total_ht + vat_amount + stamp_amount. "
+                "Si l'écart est > 1%, marque une warning. Ne corrige pas les valeurs, signale seulement."
             )
 
             user_prompt = (
-                "Extrait les informations suivantes du texte d'OCR fourni :\n"
-                "- supplier (string) : Nom du fournisseur / émetteur de la facture.\n"
-                "- tax_identifier (string) : Identifiant fiscal (MF / RNE / TVA intra-UE) ou null.\n"
-                "- invoice_number (string) : Numéro / référence du document.\n"
-                "- invoice_date (string) : Date normalisée au format YYYY-MM-DD.\n"
-                "- total_ht (string) : Montant hors taxes (Subtotal / Total HT).\n"
-                "- vat_amount (string) : Montant de TVA / VAT. null si non mentionné explicitement.\n"
-                "- stamp_amount (string) : Montant du timbre fiscal. null si absent.\n"
-                "- total_ttc (string) : Montant toutes taxes comprises (TOTAL).\n"
-                "- currency (string) : Code ISO devise (TND, EUR, USD…). Par défaut \"TND\".\n"
-                "- document_type (string) : \"Facture\", \"Reçu\", \"Avoir\", \"Note\" ou \"Autre\".\n"
-                "- category (string) : Catégorie métier stricte, choisis PARMI CETTE LISTE EXACTE :\n"
-                "  [\"Achats de marchandises\", \"Matières premières\", \"Fournitures de bureau\", \"Informatique\", \"Télécommunication\", \"Eau, électricité, gaz\", \"Loyer\", \"Assurance\", \"Publicité et marketing\", \"Transport\", \"Déplacements\", \"Entretien et réparation\", \"Honoraires\", \"Formation\", \"Frais bancaires\", \"Impôts et taxes\", \"Salaires et charges sociales\", \"Immobilisations\"]\n"
-                "  Si non applicable ou introuvable, retourne null.\n"
-                "- confidence (object) : niveau de confiance par champ (low/medium/high).\n"
-                "- missing_fields (array) : champs non trouvés.\n"
-                "- warnings (array) : avertissements.\n\n"
-                f"Texte extrait :\n\"\"\"\n{text[:6000]}\n\"\"\"\n\nJSON :"
+                "Extrait les informations suivantes du texte OCR ci-dessous.\n"
+                "Retourne STRICTEMENT ce schéma JSON (toutes les clés, null si non trouvé) :\n"
+                "{\n"
+                '  "supplier": "Nom exact du fournisseur émetteur",\n'
+                '  "tax_identifier": "Matricule fiscal ou null",\n'
+                '  "invoice_number": "Numéro complet de la facture ou null",\n'
+                '  "invoice_date": "YYYY-MM-DD ou null",\n'
+                '  "total_ht": "montant en string ex: 1500.000 ou null",\n'
+                '  "vat_amount": "montant TVA en string ou null (jamais calculé)",\n'
+                '  "stamp_amount": "montant timbre en string ou null",\n'
+                '  "total_ttc": "montant TTC en string ou null",\n'
+                '  "currency": "TND par défaut, sinon EUR/USD/etc.",\n'
+                '  "document_type": "Facture|Reçu|Avoir|Note|Autre",\n'
+                '  "category": "catégorie parmi la liste ou null",\n'
+                '  "confidence": {"supplier":"high","invoice_number":"medium",...},\n'
+                '  "missing_fields": ["champs absents"],\n'
+                '  "warnings": ["anomalies détectées"]\n'
+                "}\n\n"
+                "Catégories autorisées UNIQUEMENT : "
+                "Achats de marchandises, Matières premières, Fournitures de bureau, Informatique, "
+                "Télécommunication, Eau électricité gaz, Loyer, Assurance, Publicité et marketing, "
+                "Transport, Déplacements, Entretien et réparation, Honoraires, Formation, "
+                "Frais bancaires, Impôts et taxes, Salaires et charges sociales, Immobilisations.\n\n"
+                f"=== TEXTE OCR ===\n{text[:12000]}\n=== FIN DU TEXTE ===\n\nJSON:"
             )
+
+
 
             model_name = self._get_best_model()
 
@@ -395,12 +465,12 @@ class ExtractionService:
 
             t = threading.Thread(target=_call, daemon=True)
             t.start()
-            t.join(timeout=5)   # fail fast if Ollama is not running
+            t.join(timeout=60)   # give model up to 60 s to respond
 
             if _err_box:
                 raise _err_box[0]
             if not _result_box:
-                raise TimeoutError("Ollama did not respond within 30 seconds")
+                raise TimeoutError("Ollama did not respond within 60 seconds")
 
             response = _result_box[0]
             content = response.message.content.strip()
@@ -537,35 +607,49 @@ class ExtractionService:
         for brand in self._KNOWN_SUPPLIERS:
             if brand.lower() in text_lower:
                 return brand
+                
+        forbidden_words = {"facture", "reçu", "bon de", "devis", "client", "doit", "code", "date", "page", "tél", "fax", "tel", "email", "mail", "adresse"}
+
         mf_block = re.search(
             r"(.{0,80})\n[^\n]*(?:MF|matricule fiscale?|identifiant fiscal)[^\n]*",
             text, re.I
         )
         if mf_block:
-            candidate = mf_block.group(1).strip().splitlines()[-1].strip()
-            if 3 < len(candidate) < 80:
-                return candidate
+            lines = mf_block.group(1).strip().splitlines()
+            for line in reversed(lines):
+                candidate = line.strip()
+                if 3 < len(candidate) < 80 and not any(w in candidate.lower() for w in forbidden_words):
+                    return candidate
+                    
         for line in text.splitlines():
             line = line.strip()
             if 4 <= len(line) <= 70 and re.search(r"[A-Za-zÀ-ÿ]{3}", line) and not re.fullmatch(r"[\d\s.,:;/\\-]+", line):
-                return line
+                if not any(w in line.lower() for w in forbidden_words):
+                    return line
         return None
 
     def _extract_tax_id(self, text: str) -> str | None:
+        # Handles Tunisian MF format: 789012H|M|A|000 (pipes allowed, RC suffix optional)
         m = re.search(
-            r"(?:MF|matricule\s+fiscale?|identifiant\s+fiscal|n[°o]?\s*TVA)[^\n:]*[:\s]+([A-Z0-9/\\]{5,25})",
+            r"(?:MF|matricule\s+fiscale?|identifiant\s+fiscal|n[°o]?\s*TVA)[^\n:]*[:\s]+([A-Z0-9/|\\]{5,30})",
             text, re.I
         )
-        return m.group(1).strip() if m else None
+        if m:
+            return m.group(1).strip()
+        # Fallback: bare Tunisian MF pattern (digits + letter + pipes)
+        m2 = re.search(r"\b(\d{6,9}[A-Z](?:[|/][A-Z0-9]+){1,4})\b", text)
+        return m2.group(1).strip() if m2 else None
 
     def _extract_invoice_number(self, text: str) -> str | None:
         patterns = [
-            r"[Ff]acture\s+[Nn][°o]?\.?\s*([A-Z0-9][-A-Z0-9/]{3,})",
-            r"[Ff]acture\s+[Nn][°o]?\.?\s*(\d{6,})",
-            r"[Ii]nvoice\s+[Nn][uo]?\.?\s*([A-Z0-9][-A-Z0-9/]{3,})",
-            r"[Rr][éeÉE]f[eé]rence\s*[:\s]+([A-Z0-9][A-Z0-9/_-]{3,})",
-            r"N[°o]?\s+[Ff]acture\s*[:\s]+([A-Z0-9][-A-Z0-9/]{3,})",
-            r"\bN[°o]\s*(\d{8,})\b",
+            r"[Ff]acture\s+[Nn][°oO]?\.?\s*:?\s*([A-Z0-9][-A-Z0-9/]{2,})",
+            r"[Ff]acture\s+[Nn][°oO]?\.?\s*:?\s*(\d{4,})",
+            r"[Ii]nvoice\s+[Nn][uo]?\.?\s*:?\s*([A-Z0-9][-A-Z0-9/]{2,})",
+            r"[Rr][éeÉE]f[eé]rence\s*[:\s]+([A-Z0-9][A-Z0-9/_-]{2,})",
+            r"N[°oO]?\s*[Ff]acture\s*[:\s]+([A-Z0-9][-A-Z0-9/]{2,})",
+            r"\bN[°oO]\s*(\d{6,})\b",
+            r"(?:Num[eé]ro|N°|No\.?)\s*[:\s]*([A-Z0-9][-A-Z0-9/]{3,})",
+            r"(?:Bon de commande|BC)\s*[Nn]?[°oO]?\.?\s*:?\s*([A-Z0-9][-A-Z0-9/]{2,})",
         ]
         for pat in patterns:
             m = re.search(pat, text)
@@ -574,23 +658,61 @@ class ExtractionService:
         return None
 
     def _extract_date(self, text: str) -> str | None:
+        # 1 — date near a label
         labelled = re.search(
-            r"(?:date\s+(?:limite\s+de\s+)?(?:paiement|facture|[eé]mission|du?\s+document)[^\n]{0,30})"
-            r"(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2})",
+            r"(?:date\s+(?:limite\s+de\s+)?(?:paiement|facture|[eé]mission|du?\s+document|d[ée]livrance)[^\n]{0,30})"
+            r"(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/-]\d{2}[/-]\d{2})",
             text, re.I
         )
         target = labelled.group(1) if labelled else None
+
+        # 2 — written month name (e.g. "15 janvier 2024" or "15/Jan/2024")
         if not target:
-            m = re.search(r"\b(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2})\b", text)
+            month_map = {
+                "janvier": "01", "février": "02", "mars": "03", "avril": "04",
+                "mai": "05", "juin": "06", "juillet": "07", "août": "08",
+                "septembre": "09", "octobre": "10", "novembre": "11", "décembre": "12",
+                "jan": "01", "fev": "02", "mar": "03", "avr": "04",
+                "jun": "06", "jul": "07", "aou": "08", "sep": "09",
+                "oct": "10", "nov": "11", "dec": "12",
+            }
+            m = re.search(
+                r"(\d{1,2})\s+("
+                + "|".join(month_map.keys())
+                + r")\s+(\d{2,4})",
+                text, re.I
+            )
+            if m:
+                day, mon, year = m.group(1), m.group(2).lower(), m.group(3)
+                year_i = int(year) + (2000 if len(year) == 2 else 0)
+                return f"{year_i:04d}-{month_map[mon]}-{int(day):02d}"
+
+        # 3 — bare date pattern
+        if not target:
+            m = re.search(
+                r"\b(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/-]\d{2}[/-]\d{2})\b", text)
             target = m.group(1) if m else None
+
         if not target:
             return None
-        return self._normalise_date(target.replace(".", "/").replace("-", "/"))
+        return self._normalise_date(target.replace(".", "/"))
 
     def _extract_labelled_amount(self, text: str, label_pattern: str) -> str | None:
-        pattern = r"(?i)" + label_pattern + r"[^\n\d]{0,30}((?:\d{1,3}[,\s])*\d{1,3}[,.]\d{2,3})"
-        m = re.search(pattern, text, re.I)
-        return self._decimal_string(m.group(1)) if m else None
+        # Allow the amount to appear on the SAME line or the NEXT line after the label
+        pattern = (
+            r"(?i)" + label_pattern
+            + r"[^\n\d]{0,40}((?:\d{1,3}[\s,])*\d{1,3}[,.]\d{2,3})"
+        )
+        m = re.search(pattern, text, re.I | re.DOTALL)
+        if m:
+            return self._decimal_string(m.group(1))
+        # Second attempt: label on one line, amount on the very next line
+        pattern2 = (
+            r"(?i)" + label_pattern
+            + r"[^\n]*\n\s*((?:\d{1,3}[\s,])*\d{1,3}[,.]\d{2,3})"
+        )
+        m2 = re.search(pattern2, text, re.I)
+        return self._decimal_string(m2.group(1)) if m2 else None
 
     # ── Result validation & normalisation ─────────────────────────────────────
 
@@ -642,7 +764,24 @@ class ExtractionService:
         clean["missing_fields"] = sorted(
             set(clean["missing_fields"] + [k for k in AI_FIELDS if not clean.get(k)])
         )
+
+        # ── Arithmetic cross-check: TTC should equal HT + VAT + stamp ──────────
+        try:
+            ttc   = Decimal(clean["total_ttc"])   if clean.get("total_ttc")    else None
+            ht    = Decimal(clean["total_ht"])     if clean.get("total_ht")     else None
+            vat   = Decimal(clean["vat_amount"])   if clean.get("vat_amount")   else Decimal("0")
+            stamp = Decimal(clean["stamp_amount"]) if clean.get("stamp_amount") else Decimal("0")
+            if ttc and ht:
+                computed = ht + vat + stamp
+                if ttc > 0 and abs(computed - ttc) / ttc > Decimal("0.01"):
+                    clean["warnings"].append(
+                        f"Incohérence montants: HT({ht})+TVA({vat})+Timbre({stamp})={computed} ≠ TTC({ttc})"
+                    )
+        except (InvalidOperation, TypeError):
+            pass
+
         return clean
+
 
     # ── Apply result to Invoice ORM object ─────────────────────────────────────
 
@@ -677,23 +816,74 @@ class ExtractionService:
 
     @staticmethod
     def _decimal_string(value: str | None) -> str | None:
+        """Parse an amount string into a normalised decimal string (3 decimal places).
+
+        Handles:
+          - Tunisian  : '3,732'  → 3.732   (comma = decimal, ≤3 digits after)
+          - European  : '1.400,00' → 1400.000
+          - US/Anglo  : '1,400.00' → 1400.000
+          - Spaced    : '3 732,500' → 3732.500
+          - OCR noise : 'DT', 'TND', currency symbols stripped
+        """
         if not value:
             return None
+        # Strip currency labels and whitespace variants
+        normalized = re.sub(r"[A-Za-z$€£]", "", str(value))
         normalized = (
-            str(value)
-            .replace("\u00a0", "")
-            .replace("\u202f", "")
+            normalized
+            .replace("\u00a0", "")   # non-breaking space
+            .replace("\u202f", "")   # narrow no-break space
             .replace(" ", "")
             .replace("'", "")
+            .strip()
         )
-        if normalized.count(",") == 1 and normalized.count(".") == 0:
-            normalized = normalized.replace(",", ".")
-        elif "," in normalized and "." in normalized:
+        if not normalized:
+            return None
+
+        comma_count = normalized.count(",")
+        dot_count   = normalized.count(".")
+
+        if comma_count == 0 and dot_count == 0:
+            # Pure integer like '1400'
+            pass
+        elif comma_count == 1 and dot_count == 0:
+            # Could be Tunisian decimal ('3,732') or thousands ('1,400')
+            after_comma = normalized.split(",")[1]
+            if len(after_comma) <= 3 and len(after_comma) != 3:
+                # Short fraction → decimal separator
+                normalized = normalized.replace(",", ".")
+            elif len(after_comma) == 3:
+                # Ambiguous: if value > 999, treat comma as thousands sep; else decimal
+                try:
+                    int_part = int(normalized.split(",")[0])
+                except ValueError:
+                    int_part = 0
+                if int_part >= 10:
+                    normalized = normalized.replace(",", "")   # thousands
+                else:
+                    normalized = normalized.replace(",", ".")  # decimal
+            else:
+                normalized = normalized.replace(",", "")       # thousands
+        elif dot_count == 1 and comma_count == 0:
+            pass  # already valid decimal
+        elif comma_count >= 1 and dot_count >= 1:
+            # e.g. '1.400,00' (European) or '1,400.00' (US)
+            last_comma = normalized.rfind(",")
+            last_dot   = normalized.rfind(".")
+            if last_comma > last_dot:
+                # Comma is decimal separator: remove dots, replace comma
+                normalized = normalized.replace(".", "").replace(",", ".")
+            else:
+                # Dot is decimal separator: remove commas
+                normalized = normalized.replace(",", "")
+        else:
             normalized = normalized.replace(",", "")
+
         try:
             return f"{Decimal(normalized):.3f}"
         except InvalidOperation:
             return None
+
 
     @staticmethod
     def _normalise_date(value: str) -> str | None:
