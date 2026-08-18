@@ -312,24 +312,20 @@ const ValidationPage = () => {
                     onChange={handleChange}
                   >
                     <option value="">-- Sélectionnez une catégorie --</option>
-                    <option value="Achats de marchandises">Achats de marchandises (Produits destinés à la revente)</option>
-                    <option value="Matières premières">Matières premières (Bois, acier, farine...)</option>
-                    <option value="Fournitures de bureau">Fournitures de bureau (Papier, stylos, cartouches)</option>
-                    <option value="Informatique">Informatique (Ordinateurs, logiciels, licences)</option>
-                    <option value="Télécommunication">Télécommunication (Téléphone, Internet)</option>
-                    <option value="Eau, électricité, gaz">Eau, électricité, gaz (Factures des fournisseurs d'énergie)</option>
-                    <option value="Loyer">Loyer (Bureaux, magasins, entrepôts)</option>
-                    <option value="Assurance">Assurance (Véhicule, locaux, responsabilité civile)</option>
-                    <option value="Publicité et marketing">Publicité et marketing (Facebook Ads, Google Ads, affiches)</option>
-                    <option value="Transport">Transport (Taxi, carburant, livraison)</option>
-                    <option value="Déplacements">Déplacements (Billets d'avion, hôtels, missions)</option>
-                    <option value="Entretien et réparation">Entretien et réparation (Maintenance des équipements)</option>
-                    <option value="Honoraires">Honoraires (Comptable, avocat, consultant)</option>
-                    <option value="Formation">Formation (Cours, séminaires)</option>
-                    <option value="Frais bancaires">Frais bancaires (Commissions, tenue de compte)</option>
-                    <option value="Impôts et taxes">Impôts et taxes (Taxes locales, droits divers)</option>
-                    <option value="Salaires et charges sociales">Salaires et charges sociales (Rémunération du personnel)</option>
-                    <option value="Immobilisations">Immobilisations (Machines, véhicules, mobilier, bâtiments)</option>
+                    <option value="Marchandises & Matières">Marchandises & Matières (Stock, matières premières)</option>
+                    <option value="Énergie & Fluides">Énergie & Fluides (Électricité, Eau)</option>
+                    <option value="Petits Équipements">Petits Équipements (Outillage, matériel léger)</option>
+                    <option value="Fournitures de Bureau">Fournitures de Bureau (Papier, stylos, cartouches)</option>
+                    <option value="Loyers & Leasing">Loyers & Leasing (Loyer, crédit-bail)</option>
+                    <option value="Entretien & Réparations">Entretien & Réparations (Maintenance informatique, véhicules)</option>
+                    <option value="Assurances">Assurances (Primes d'assurances)</option>
+                    <option value="Honoraires & Conseil">Honoraires & Conseil (Expert-comptable, avocat, études)</option>
+                    <option value="Publicité & Marketing">Publicité & Marketing (Campagnes Web, flyers)</option>
+                    <option value="Voyages & Déplacements">Voyages & Déplacements (Billets d'avion, hôtels)</option>
+                    <option value="Repas & Réceptions">Repas & Réceptions (Restaurants avec partenaires)</option>
+                    <option value="Télécoms & Courrier">Télécoms & Courrier (Internet, forfaits mobiles, timbres)</option>
+                    <option value="Frais Bancaires">Frais Bancaires (Intérêts, agios, commissions)</option>
+                    <option value="Immobilisations">Immobilisations (Ordinateurs, voitures, meubles &gt; 500 DT HT)</option>
                   </Form.Select>
                 </Form.Group>
 

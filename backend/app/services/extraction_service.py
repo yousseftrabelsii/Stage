@@ -103,9 +103,6 @@ def _get_paddle_ocr():
         try:
             from paddleocr import PaddleOCR
             # PaddleOCR 3.x API:
-            # - use_textline_orientation replaces deprecated use_angle_cls
-            # - show_log was removed in 3.x
-            # - lang='fr' supports French + Latin script invoices
             _paddle_ocr = PaddleOCR(
                 use_textline_orientation=True,
                 lang="fr",
@@ -240,6 +237,9 @@ class ExtractionService:
                 image = cv2.resize(image, None, fx=scale, fy=scale,
                                    interpolation=cv2.INTER_CUBIC)
 
+            # ── 1. Document Cropping (Smart Scan) ──
+            image = self._smart_crop(image)
+
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
             # ── Denoise ──
@@ -248,6 +248,10 @@ class ExtractionService:
             # ── CLAHE — improve local contrast for faded/uneven scans ──
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray = clahe.apply(gray)
+            
+            # ── 2. Grid & Line Removal ──
+            # Remove horizontal/vertical lines that confuse OCR
+            gray = self._remove_lines_and_noise(gray)
 
             # ── Sharpen — improves blurry/photocopied documents ──
             kernel_sharpen = np.array([[-1, -1, -1],
@@ -256,60 +260,95 @@ class ExtractionService:
             gray = cv2.filter2D(gray, -1, kernel_sharpen)
 
             # ── Deskew ── (straighten rotated scans up to ±10°)
-            # Work on a binary copy for deskew detection, then apply to color image
-            _, binary_deskew = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
-            binary_deskew = self._deskew(binary_deskew)
+            gray = self._deskew(gray)
 
             # Reconstruct a color (BGR) enhanced image from deskewed gray for PaddleOCR
-            enhanced_gray = self._deskew(gray)
-            enhanced_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+            # PaddleOCR performs best on color/grayscale images (not aggressively binarized)
+            enhanced_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+            # ── 3. Adaptive Binarization & 4. Morphological Erosion ──
+            # Tesseract performs better on binarized images. We use Adaptive Thresholding
+            # and a light erosion (which thickens black text) for faint characters.
+            binary_for_tess = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 10
+            )
+            kernel_morph = np.ones((1, 1), np.uint8)
+            binary_for_tess = cv2.erode(binary_for_tess, kernel_morph, iterations=1)
 
             # ── Run PaddleOCR ──
             ocr = _get_paddle_ocr()
-            if ocr is None:
-                raise RuntimeError("PaddleOCR could not be initialised")
+            if ocr is not None:
+                try:
+                    # PaddleOCR 3.x: use predict() — ocr() with cls kwarg is removed
+                    result = list(ocr.predict(enhanced_bgr))
 
-            # Note: cls=True removed — use_textline_orientation handles orientation
-            result = ocr.ocr(enhanced_bgr)
+                    # ── Flatten results into text lines ──
+                    # v3 returns an iterable of OCRResult objects with .rec_texts attribute
+                    lines: list[str] = []
+                    for page in result:
+                        if page is None:
+                            continue
+                        # v3 OCRResult object
+                        if hasattr(page, 'rec_texts'):
+                            for text_line in page.rec_texts:
+                                if text_line and text_line.strip():
+                                    lines.append(text_line.strip())
+                        else:
+                            # Legacy v2 fallback: list of [box_coords, (text, score)]
+                            for box in page:
+                                try:
+                                    text_info = box[1]
+                                    if isinstance(text_info, (list, tuple)):
+                                        text_line = text_info[0]
+                                    else:
+                                        text_line = str(text_info)
+                                    text_line = text_line.strip()
+                                    if text_line:
+                                        lines.append(text_line)
+                                except (IndexError, TypeError):
+                                    continue
 
-            # ── Flatten results into text lines ──
-            # Handles both PaddleOCR v2 (list of lists) and v3 (OCRResult objects)
-            lines: list[str] = []
-            if result:
-                for page in result:
-                    if page is None:
-                        continue
-                    # v3 returns OCRResult objects with .rec_texts / .rec_scores attrs
-                    if hasattr(page, 'rec_texts'):
-                        for text_line in page.rec_texts:
-                            if text_line and text_line.strip():
-                                lines.append(text_line.strip())
-                    else:
-                        # v2 format: list of [box_coords, (text, score)]
-                        for box in page:
-                            try:
-                                text_info = box[1]
-                                if isinstance(text_info, (list, tuple)):
-                                    text_line = text_info[0]
-                                else:
-                                    text_line = str(text_info)
-                                text_line = text_line.strip()
-                                if text_line:
-                                    lines.append(text_line)
-                            except (IndexError, TypeError):
-                                continue
+                    recognized_text = "\n".join(lines).strip()
+                    if recognized_text:
+                        print(f"[PaddleOCR] Extracted {len(lines)} lines.")
+                        return recognized_text
+                    print("[PaddleOCR] No text found, trying Tesseract fallback.")
+                except Exception as paddle_exc:
+                    print(f"[PaddleOCR] predict() failed: {paddle_exc} — falling back to Tesseract.")
+            else:
+                print("[PaddleOCR] Not available, falling back to Tesseract.")
 
-            recognized_text = "\n".join(lines).strip()
-            print(f"[PaddleOCR] Extracted {len(lines)} lines.")
-            return recognized_text
+            # ── Tesseract fallback ──
+            try:
+                import pytesseract
+                from flask import current_app
+                from PIL import Image
+                import io
+
+                cmd = current_app.config.get("TESSERACT_CMD", "")
+                if cmd:
+                    pytesseract.pytesseract.tesseract_cmd = cmd
+
+                lang = current_app.config.get("TESSERACT_LANGUAGES", "fra+eng")
+
+                # Feed Tesseract the binarized and morphologically thickened image
+                pil_img = Image.fromarray(binary_for_tess)
+                tess_text = pytesseract.image_to_string(
+                    pil_img,
+                    lang=lang,
+                    config="--oem 3 --psm 6",
+                ).strip()
+                print(f"[Tesseract] Extracted {len(tess_text.splitlines())} lines.")
+                return tess_text
+            except Exception as tess_exc:
+                print(f"[Tesseract] Fallback also failed: {tess_exc}")
+                return ""
 
         except ImportError as exc:
-            raise RuntimeError("OpenCV and PaddleOCR are required for OCR") from exc
+            raise RuntimeError("OpenCV is required for OCR") from exc
         except Exception as exc:
             import traceback
-            print(f"[PaddleOCR] OCR failed: {exc}")
+            print(f"[OCR] Failed: {exc}")
             traceback.print_exc()
             return ""
 
@@ -335,30 +374,184 @@ class ExtractionService:
         except Exception:
             return image
 
+    @staticmethod
+    def _smart_crop(image):
+        """Automatically crop the image to the document contours, like a mobile scanner app."""
+        try:
+            import cv2
+            import numpy as np
+            
+            # Resize for faster edge detection
+            h, w = image.shape[:2]
+            ratio = h / 500.0
+            resized = cv2.resize(image, (int(w / ratio), 500))
+            
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            edged = cv2.Canny(gray, 75, 200)
+            
+            cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
+            
+            screenCnt = None
+            for c in cnts:
+                peri = cv2.arcLength(c, True)
+                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+                if len(approx) == 4:
+                    screenCnt = approx
+                    break
+                    
+            if screenCnt is None:
+                return image
+                
+            # Ensure contour is large enough (e.g. > 10% of image area)
+            if cv2.contourArea(screenCnt) < (resized.shape[0] * resized.shape[1] * 0.1):
+                return image
+                
+            # Map back to original image size
+            pts = screenCnt.reshape(4, 2) * ratio
+            
+            # Order points (top-left, top-right, bottom-right, bottom-left)
+            rect = np.zeros((4, 2), dtype="float32")
+            s = pts.sum(axis=1)
+            rect[0] = pts[np.argmin(s)]
+            rect[2] = pts[np.argmax(s)]
+            diff = np.diff(pts, axis=1)
+            rect[1] = pts[np.argmin(diff)]
+            rect[3] = pts[np.argmax(diff)]
+            
+            (tl, tr, br, bl) = rect
+            widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+            widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+            maxWidth = max(int(widthA), int(widthB))
+            
+            heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+            heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+            maxHeight = max(int(heightA), int(heightB))
+            
+            dst = np.array([
+                [0, 0],
+                [maxWidth - 1, 0],
+                [maxWidth - 1, maxHeight - 1],
+                [0, maxHeight - 1]], dtype="float32")
+                
+            M = cv2.getPerspectiveTransform(rect, dst)
+            return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+        except Exception as e:
+            print(f"[Smart Crop] Failed, using original: {e}")
+            return image
+
+    @staticmethod
+    def _remove_lines_and_noise(gray):
+        """Remove horizontal/vertical lines that confuse OCR."""
+        try:
+            import cv2
+            import numpy as np
+            
+            # Binarize the image (invert so text/lines are white)
+            thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                           cv2.THRESH_BINARY_INV, 21, 10)
+            
+            # Detect horizontal lines
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+            detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+            
+            # Detect vertical lines
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+            detect_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+            
+            # Combine lines
+            lines = cv2.add(detect_horizontal, detect_vertical)
+            
+            # Thicken lines a bit for better masking
+            kernel = np.ones((3, 3), np.uint8)
+            lines = cv2.dilate(lines, kernel, iterations=1)
+            
+            # Inpaint to remove the lines from the original grayscale image
+            cleaned = cv2.inpaint(gray, lines, 3, cv2.INPAINT_TELEA)
+            return cleaned
+        except Exception as e:
+            print(f"[Line Removal] Failed, using original: {e}")
+            return gray
+
     # ── Structured data extraction ─────────────────────────────────────────────
 
     def _guess_category_from_text(self, text: str) -> str | None:
-        """Keyword-based category detection from OCR text."""
+        """Keyword-based category detection using Tunisian SCE (Plan Comptable) codes."""
         text_lower = text.lower()
+        # Keys must exactly match the allowed_categories whitelist and frontend options.
         keywords: dict[str, list[str]] = {
-            "Achats de marchandises": ["marchandise", "revente", "grossiste", "stock", "article"],
-            "Matières premières":     ["matière première", "bois", "acier", "farine", "ciment", "fer"],
-            "Fournitures de bureau":  ["fourniture", "papier", "stylo", "cartouche", "imprimante", "papeterie", "encre"],
-            "Informatique":           ["ordinateur", "logiciel", "licence", "pc", "serveur", "clavier", "écran", "informatique", "software", "hardware"],
-            "Télécommunication":      ["télécom", "téléphone", "internet", "fibre", "mobile", "forfait", "adsl", "ooredoo", "orange", "telecom", "abonnement", "tunisie telecom"],
-            "Eau, électricité, gaz":  ["eau", "électricité", "gaz", "steg", "sonede", "énergie"],
-            "Loyer":                  ["loyer", "magasin", "entrepôt", "location", "bail", "agence immobilière"],
-            "Assurance":              ["assurance", "responsabilité civile", "prime", "sinistre", "mutuelle", "star", "gat", "comar", "ami"],
-            "Publicité et marketing": ["publicité", "marketing", "facebook ads", "google ads", "affiche", "campagne", "promotion", "sponsor", "flyer"],
-            "Transport":              ["transport", "taxi", "carburant", "livraison", "essence", "gasoil", "péage", "fret", "logistique", "agil", "total"],
-            "Déplacements":           ["déplacement", "billet d'avion", "hôtel", "mission", "voyage", "hébergement", "train", "tunisair"],
-            "Entretien et réparation":["entretien", "réparation", "maintenance", "dépannage", "pièce de rechange", "garage", "vidange"],
-            "Honoraires":             ["honoraire", "comptable", "avocat", "consultant", "notaire", "expert", "conseil", "audit"],
-            "Formation":              ["formation", "cours", "séminaire", "apprentissage", "coaching"],
-            "Frais bancaires":        ["frais bancaire", "commission", "tenue de compte", "agios", "biat", "amen", "atb"],
-            "Impôts et taxes":        ["impôt", "taxe", "douane", "timbre", "fiscal", "retenue", "recette des finances"],
-            "Salaires et charges sociales": ["salaire", "rémunération", "personnel", "paie", "fiche de paie", "cnss"],
-            "Immobilisations":        ["machine", "mobilier", "bâtiment", "équipement", "investissement"],
+            # 601 / 607 — Stock pour revente, matières premières, composants
+            "Marchandises & Matières": [
+                "marchandise", "revente", "grossiste", "stock", "matière première",
+                "composant", "article", "bois", "acier", "farine", "ciment", "fer",
+            ],
+            # 6021 / 6022 — Électricité (STEG), Eau (SONEDE)
+            "Énergie & Fluides": [
+                "électricité", "steg", "eau", "sonede", "gaz", "énergie", "fluide",
+                "carburant", "gasoil", "essence", "agil", "total énergies",
+            ],
+            # 605 — Outillage, habillement professionnel, matériel léger
+            "Petits Équipements": [
+                "outillage", "outil", "habillement professionnel", "équipement léger",
+                "matériel de bureau", "petit matériel", "clé", "perceuse",
+            ],
+            # 6022 — Papier, stylos, cartouches d'encre (Consommables)
+            "Fournitures de Bureau": [
+                "fourniture", "papier", "stylo", "cartouche", "encre", "papeterie",
+                "imprimante", "rame", "classeur", "cahier", "consommable",
+            ],
+            # 613 / 612 — Loyer de l'entrepôt, leasing automobile ou matériel
+            "Loyers & Leasing": [
+                "loyer", "location", "bail", "entrepôt", "leasing", "crédit-bail",
+                "agence immobilière", "magasin",
+            ],
+            # 615 — Maintenance informatique, réparation de véhicule
+            "Entretien & Réparations": [
+                "entretien", "réparation", "maintenance", "dépannage",
+                "pièce de rechange", "garage", "vidange", "révision",
+            ],
+            # 616 — Primes d'assurances (RC Pro, auto, locaux)
+            "Assurances": [
+                "assurance", "prime d'assurance", "responsabilité civile",
+                "sinistre", "mutuelle", "star assurances", "gat", "comar", "ami assurance",
+            ],
+            # 622 / 617 — Factures d'expert-comptable, avocat, études
+            "Honoraires & Conseil": [
+                "honoraire", "expert-comptable", "comptable", "avocat", "notaire",
+                "consultant", "conseil", "audit", "étude", "expertise", "retenue à la source",
+            ],
+            # 623 — Campagnes Web, impression de flyers, cadeaux
+            "Publicité & Marketing": [
+                "publicité", "marketing", "facebook ads", "google ads", "affiche",
+                "campagne", "promotion", "sponsor", "flyer", "cadeau",
+            ],
+            # 625 — Billets d'avion (Tunisair), hôtels, missions
+            "Voyages & Déplacements": [
+                "déplacement", "billet d'avion", "tunisair", "hôtel", "mission",
+                "voyage", "hébergement", "train", "taxi", "transport",
+            ],
+            # 625 — Factures de restaurants avec des partenaires
+            "Repas & Réceptions": [
+                "restaurant", "repas", "réception", "dîner", "déjeuner", "buffet",
+                "traiteur", "café",
+            ],
+            # 626 — Internet, forfaits mobiles (TT, Ooredoo, Orange), timbres
+            "Télécoms & Courrier": [
+                "télécom", "internet", "forfait", "mobile", "tunisie telecom",
+                "ooredoo", "orange", "fibre", "adsl", "timbre", "courrier", "poste",
+            ],
+            # 65 — Intérêts de crédits, agios, commissions de compte
+            "Frais Bancaires": [
+                "frais bancaire", "commission bancaire", "agios", "intérêt",
+                "tenue de compte", "biat", "amen bank", "atb", "stb", "bh",
+            ],
+            # Classe 2 — Ordinateurs, voitures de fonction, meubles (> 500 DT HT)
+            "Immobilisations": [
+                "immobilisation", "ordinateur", "voiture de fonction", "meuble",
+                "machine", "mobilier", "bâtiment", "matériel informatique",
+                "investissement", "logiciel",
+            ],
         }
         for category, words in keywords.items():
             for word in words:
@@ -447,10 +640,10 @@ class ExtractionService:
                 '  "warnings": ["anomalies détectées"]\n'
                 "}\n\n"
                 "Catégories autorisées UNIQUEMENT : "
-                "Achats de marchandises, Matières premières, Fournitures de bureau, Informatique, "
-                "Télécommunication, Eau électricité gaz, Loyer, Assurance, Publicité et marketing, "
-                "Transport, Déplacements, Entretien et réparation, Honoraires, Formation, "
-                "Frais bancaires, Impôts et taxes, Salaires et charges sociales, Immobilisations.\n\n"
+                "Marchandises & Matières, Énergie & Fluides, Petits Équipements, Fournitures de Bureau, "
+                "Loyers & Leasing, Entretien & Réparations, Assurances, Honoraires & Conseil, "
+                "Publicité & Marketing, Voyages & Déplacements, Repas & Réceptions, "
+                "Télécoms & Courrier, Frais Bancaires, Immobilisations.\n\n"
                 f"=== TEXTE OCR ===\n{text[:12000]}\n=== FIN DU TEXTE ===\n\nJSON:"
             )
 
@@ -747,11 +940,8 @@ class ExtractionService:
         for field in MONEY_FIELDS:
             clean[field] = self._decimal_string(clean[field])
 
-        if clean["invoice_date"]:
-            try:
-                clean["invoice_date"] = date.fromisoformat(str(clean["invoice_date"])).isoformat()
-            except ValueError:
-                clean["invoice_date"] = None
+        if clean.get("invoice_date"):
+            clean["invoice_date"] = self._normalise_date(clean["invoice_date"])
 
         raw_currency = clean.get("currency")
         clean["currency"] = str(raw_currency or "TND").strip().upper()[:10] or "TND"
@@ -761,13 +951,22 @@ class ExtractionService:
         dt = clean.get("document_type")
         clean["document_type"] = dt if dt in allowed_types else "Facture"
         
-        # Normalise category
+        # Normalise category — must match SCE (Plan Comptable Tunisien) labels
         allowed_categories = {
-            "Achats de marchandises", "Matières premières", "Fournitures de bureau",
-            "Informatique", "Télécommunication", "Eau, électricité, gaz", "Loyer",
-            "Assurance", "Publicité et marketing", "Transport", "Déplacements",
-            "Entretien et réparation", "Honoraires", "Formation", "Frais bancaires",
-            "Impôts et taxes", "Salaires et charges sociales", "Immobilisations"
+            "Marchandises & Matières",   # 601/607
+            "Énergie & Fluides",          # 6021/6022
+            "Petits Équipements",         # 605
+            "Fournitures de Bureau",       # 6022
+            "Loyers & Leasing",           # 613/612
+            "Entretien & Réparations",    # 615
+            "Assurances",                 # 616
+            "Honoraires & Conseil",        # 622/617
+            "Publicité & Marketing",       # 623
+            "Voyages & Déplacements",      # 625
+            "Repas & Réceptions",          # 625
+            "Télécoms & Courrier",         # 626
+            "Frais Bancaires",             # 65
+            "Immobilisations",             # Classe 2
         }
         c = clean.get("category")
         if not c or c not in allowed_categories:
@@ -903,11 +1102,48 @@ class ExtractionService:
 
     @staticmethod
     def _normalise_date(value: str) -> str | None:
-        parts = re.split(r"[-/]", value)
+        value = str(value).strip()
+        if not value:
+            return None
+
+        import re
+        from datetime import date
+
+        # 1. Try exact ISO first (YYYY-MM-DD)
         try:
-            if len(parts[0]) == 4:
-                return date(int(parts[0]), int(parts[1]), int(parts[2])).isoformat()
-            year = int(parts[2]) + (2000 if len(parts[2]) == 2 else 0)
-            return date(year, int(parts[1]), int(parts[0])).isoformat()
-        except (ValueError, IndexError):
+            return date.fromisoformat(value).isoformat()
+        except ValueError:
+            pass
+
+        # 2. Try DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
+        d_match = re.match(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$", value)
+        if d_match:
+            try:
+                return date(int(d_match.group(3)), int(d_match.group(2)), int(d_match.group(1))).isoformat()
+            except ValueError:
+                pass
+
+        # 3. Try YYYY/MM/DD, YYYY-MM-DD, YYYY.MM.DD
+        y_match = re.match(r"^(\d{4})[/.-](\d{1,2})[/.-](\d{1,2})$", value)
+        if y_match:
+            try:
+                return date(int(y_match.group(1)), int(y_match.group(2)), int(y_match.group(3))).isoformat()
+            except ValueError:
+                pass
+
+        # 4. Try DD/MM/YY
+        yy_match = re.match(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2})$", value)
+        if yy_match:
+            try:
+                year = 2000 + int(yy_match.group(3))
+                return date(year, int(yy_match.group(2)), int(yy_match.group(1))).isoformat()
+            except ValueError:
+                pass
+                
+        # 5. Try dateutil parser as a last resort
+        try:
+            from dateutil import parser
+            dt = parser.parse(value, dayfirst=True)
+            return dt.date().isoformat()
+        except Exception:
             return None
