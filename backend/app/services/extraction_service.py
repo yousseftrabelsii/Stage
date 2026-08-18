@@ -237,9 +237,6 @@ class ExtractionService:
                 image = cv2.resize(image, None, fx=scale, fy=scale,
                                    interpolation=cv2.INTER_CUBIC)
 
-            # ── 1. Document Cropping (Smart Scan) ──
-            image = self._smart_crop(image)
-
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
             # ── Denoise ──
@@ -248,10 +245,6 @@ class ExtractionService:
             # ── CLAHE — improve local contrast for faded/uneven scans ──
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray = clahe.apply(gray)
-            
-            # ── 2. Grid & Line Removal ──
-            # Remove horizontal/vertical lines that confuse OCR
-            gray = self._remove_lines_and_noise(gray)
 
             # ── Sharpen — improves blurry/photocopied documents ──
             kernel_sharpen = np.array([[-1, -1, -1],
@@ -259,21 +252,35 @@ class ExtractionService:
                                         [-1, -1, -1]])
             gray = cv2.filter2D(gray, -1, kernel_sharpen)
 
+            # ── Advanced Pretreatment: Table Grid & Line Removal ──
+            # Table lines often confuse OCR engines (read as 1, I, l). We use morphology to erase them.
+            binary_for_lines = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 10
+            )
+            # Remove horizontal lines
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+            remove_horizontal = cv2.morphologyEx(binary_for_lines, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+            cnts, _ = cv2.findContours(remove_horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in cnts:
+                cv2.drawContours(gray, [c], -1, (255, 255, 255), 3) # Erase line with white
+                
+            # Remove vertical lines
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+            remove_vertical = cv2.morphologyEx(binary_for_lines, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+            cnts, _ = cv2.findContours(remove_vertical, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in cnts:
+                cv2.drawContours(gray, [c], -1, (255, 255, 255), 3) # Erase line with white
+
             # ── Deskew ── (straighten rotated scans up to ±10°)
-            gray = self._deskew(gray)
+            # Work on a binary copy for deskew detection, then apply to color image
+            _, binary_deskew = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            binary_deskew = self._deskew(binary_deskew)
 
             # Reconstruct a color (BGR) enhanced image from deskewed gray for PaddleOCR
-            # PaddleOCR performs best on color/grayscale images (not aggressively binarized)
-            enhanced_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-            # ── 3. Adaptive Binarization & 4. Morphological Erosion ──
-            # Tesseract performs better on binarized images. We use Adaptive Thresholding
-            # and a light erosion (which thickens black text) for faint characters.
-            binary_for_tess = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 10
-            )
-            kernel_morph = np.ones((1, 1), np.uint8)
-            binary_for_tess = cv2.erode(binary_for_tess, kernel_morph, iterations=1)
+            enhanced_gray = self._deskew(gray)
+            enhanced_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
 
             # ── Run PaddleOCR ──
             ocr = _get_paddle_ocr()
@@ -282,14 +289,28 @@ class ExtractionService:
                     # PaddleOCR 3.x: use predict() — ocr() with cls kwarg is removed
                     result = list(ocr.predict(enhanced_bgr))
 
-                    # ── Flatten results into text lines ──
-                    # v3 returns an iterable of OCRResult objects with .rec_texts attribute
+                    # ── Flatten results into text lines (Layout Preserving) ──
                     lines: list[str] = []
                     for page in result:
                         if page is None:
                             continue
-                        # v3 OCRResult object
-                        if hasattr(page, 'rec_texts'):
+                        # v3 OCRResult object with bounding boxes
+                        if hasattr(page, 'rec_texts') and hasattr(page, 'dt_polys'):
+                            items = []
+                            for idx, text_line in enumerate(page.rec_texts):
+                                if text_line and text_line.strip() and idx < len(page.dt_polys):
+                                    poly = np.array(page.dt_polys[idx])
+                                    y_center = np.mean(poly[:, 1])
+                                    x_center = np.mean(poly[:, 0])
+                                    items.append((y_center, x_center, text_line.strip()))
+                            
+                            # Sort by Y-coord (bucketed to group same line) then X-coord
+                            # This strictly preserves layout/columns!
+                            items.sort(key=lambda x: (int(x[0] / 15), x[1]))
+                            for _, _, text_line in items:
+                                lines.append(text_line)
+                        elif hasattr(page, 'rec_texts'):
+                            # Fallback if no polygons available
                             for text_line in page.rec_texts:
                                 if text_line and text_line.strip():
                                     lines.append(text_line.strip())
@@ -331,8 +352,7 @@ class ExtractionService:
 
                 lang = current_app.config.get("TESSERACT_LANGUAGES", "fra+eng")
 
-                # Feed Tesseract the binarized and morphologically thickened image
-                pil_img = Image.fromarray(binary_for_tess)
+                pil_img = Image.fromarray(enhanced_gray)
                 tess_text = pytesseract.image_to_string(
                     pil_img,
                     lang=lang,
@@ -373,106 +393,6 @@ class ExtractionService:
                                   borderMode=cv2.BORDER_REPLICATE)
         except Exception:
             return image
-
-    @staticmethod
-    def _smart_crop(image):
-        """Automatically crop the image to the document contours, like a mobile scanner app."""
-        try:
-            import cv2
-            import numpy as np
-            
-            # Resize for faster edge detection
-            h, w = image.shape[:2]
-            ratio = h / 500.0
-            resized = cv2.resize(image, (int(w / ratio), 500))
-            
-            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (5, 5), 0)
-            edged = cv2.Canny(gray, 75, 200)
-            
-            cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
-            
-            screenCnt = None
-            for c in cnts:
-                peri = cv2.arcLength(c, True)
-                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-                if len(approx) == 4:
-                    screenCnt = approx
-                    break
-                    
-            if screenCnt is None:
-                return image
-                
-            # Ensure contour is large enough (e.g. > 10% of image area)
-            if cv2.contourArea(screenCnt) < (resized.shape[0] * resized.shape[1] * 0.1):
-                return image
-                
-            # Map back to original image size
-            pts = screenCnt.reshape(4, 2) * ratio
-            
-            # Order points (top-left, top-right, bottom-right, bottom-left)
-            rect = np.zeros((4, 2), dtype="float32")
-            s = pts.sum(axis=1)
-            rect[0] = pts[np.argmin(s)]
-            rect[2] = pts[np.argmax(s)]
-            diff = np.diff(pts, axis=1)
-            rect[1] = pts[np.argmin(diff)]
-            rect[3] = pts[np.argmax(diff)]
-            
-            (tl, tr, br, bl) = rect
-            widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-            widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-            maxWidth = max(int(widthA), int(widthB))
-            
-            heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-            heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-            maxHeight = max(int(heightA), int(heightB))
-            
-            dst = np.array([
-                [0, 0],
-                [maxWidth - 1, 0],
-                [maxWidth - 1, maxHeight - 1],
-                [0, maxHeight - 1]], dtype="float32")
-                
-            M = cv2.getPerspectiveTransform(rect, dst)
-            return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-        except Exception as e:
-            print(f"[Smart Crop] Failed, using original: {e}")
-            return image
-
-    @staticmethod
-    def _remove_lines_and_noise(gray):
-        """Remove horizontal/vertical lines that confuse OCR."""
-        try:
-            import cv2
-            import numpy as np
-            
-            # Binarize the image (invert so text/lines are white)
-            thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                           cv2.THRESH_BINARY_INV, 21, 10)
-            
-            # Detect horizontal lines
-            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-            detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-            
-            # Detect vertical lines
-            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-            detect_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
-            
-            # Combine lines
-            lines = cv2.add(detect_horizontal, detect_vertical)
-            
-            # Thicken lines a bit for better masking
-            kernel = np.ones((3, 3), np.uint8)
-            lines = cv2.dilate(lines, kernel, iterations=1)
-            
-            # Inpaint to remove the lines from the original grayscale image
-            cleaned = cv2.inpaint(gray, lines, 3, cv2.INPAINT_TELEA)
-            return cleaned
-        except Exception as e:
-            print(f"[Line Removal] Failed, using original: {e}")
-            return gray
 
     # ── Structured data extraction ─────────────────────────────────────────────
 
@@ -644,8 +564,22 @@ class ExtractionService:
                 "Loyers & Leasing, Entretien & Réparations, Assurances, Honoraires & Conseil, "
                 "Publicité & Marketing, Voyages & Déplacements, Repas & Réceptions, "
                 "Télécoms & Courrier, Frais Bancaires, Immobilisations.\n\n"
-                f"=== TEXTE OCR ===\n{text[:12000]}\n=== FIN DU TEXTE ===\n\nJSON:"
             )
+            
+            # --- Generate Regex Pre-Hints ---
+            hints_list = []
+            dates = set(re.findall(r"\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b|\b\d{4}[/-]\d{2}[/-]\d{2}\b", text))
+            if dates:
+                hints_list.append(f"- Dates potentielles: {', '.join(dates)}")
+            mfs = set(re.findall(r"\b\d{7}[A-Z]\/[A-Z]\/[A-Z]\/\d{3}\b", text, re.I))
+            if mfs:
+                hints_list.append(f"- Matricules fiscaux potentiels: {', '.join(mfs)}")
+                
+            hints_text = ""
+            if hints_list:
+                hints_text = "HINTS (Indices trouvés par Regex) :\n" + "\n".join(hints_list) + "\n\n"
+
+            user_prompt += f"{hints_text}=== TEXTE OCR ===\n{text[:12000]}\n=== FIN DU TEXTE ===\n\nJSON:"
 
 
 
